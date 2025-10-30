@@ -311,8 +311,8 @@ def get_accelerate_model(args, checkpoint_dir):
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name_or_path,
         cache_dir=args.cache_dir,
-        #load_in_4bit=args.bits == 4,
-        #load_in_8bit=args.bits == 8,
+        load_in_4bit=args.bits == 4,
+        load_in_8bit=args.bits == 8,
         device_map=device_map,
         max_memory=max_memory,
         quantization_config=BitsAndBytesConfig(
@@ -353,7 +353,7 @@ def get_accelerate_model(args, checkpoint_dir):
         trust_remote_code=args.trust_remote_code,
         use_auth_token=args.use_auth_token,
     )
-    if tokenizer.pad_token is None:
+    if tokenizer._pad_token is None:
         smart_tokenizer_and_embedding_resize(
             special_tokens_dict=dict(pad_token=DEFAULT_PAD_TOKEN),
             tokenizer=tokenizer,
@@ -722,132 +722,65 @@ def train():
     if args.do_mmlu_eval:
         if args.mmlu_dataset == 'mmlu-zs':
             mmlu_dataset = load_dataset("json", data_files={
-                'eval': 'qlora-main/data/mmlu/zero_shot_mmlu_val.json',
-                'test': 'qlora-main/data/mmlu/zero_shot_mmlu_test.json',
+                'eval': 'data/mmlu/zero_shot_mmlu_val.json',
+                'test': 'data/mmlu/zero_shot_mmlu_test.json',
             })
-            #mmlu_dataset = mmlu_dataset.remove_columns('subject')
+            mmlu_dataset = mmlu_dataset.remove_columns('subject')
         # MMLU Five-shot (Eval/Test only)
         elif args.mmlu_dataset == 'mmlu' or args.mmlu_dataset == 'mmlu-fs':
             mmlu_dataset = load_dataset("json", data_files={
-                'eval': 'qlora-main/data/mmlu/five_shot_mmlu_val.json',
-                'test': 'qlora-main/data/mmlu/five_shot_mmlu_test.json',
+                'eval': 'data/mmlu/five_shot_mmlu_val.json',
+                'test': 'data/mmlu/five_shot_mmlu_test.json',
             })
             # mmlu_dataset = mmlu_dataset.remove_columns('subject')
         mmlu_dataset = mmlu_dataset[args.mmlu_split]
         if args.max_mmlu_samples is not None:
             mmlu_dataset = mmlu_dataset.select(range(args.max_mmlu_samples))
-
-        # Build robust A/B/C/D token ids that work with LLaMA, GPT, etc.
-        def letter_token_id(tok, ch):
-            """Return the token id for choice letter ch, trying both with and without leading space."""
-            ids_ws = tok.encode(f" {ch}", add_special_tokens=False)
-            if len(ids_ws) == 1:
-                return ids_ws[0]
-            ids_no = tok.encode(ch, add_special_tokens=False)
-            if len(ids_no) == 1:
-                return ids_no[0]
-            return None  # multi-token, will handle separately
-
-        abcd_idx = [letter_token_id(tokenizer, ch) for ch in "ABCD"]
-
-        import torch.nn.functional as F
-
-        def choice_logprob_first_tokens(logits_seq, start_t, tok, text):
-            """Compute total log-prob of first tokens corresponding to one answer choice."""
-            # Try with leading space first (models usually generate " Answer: A")
-            cand_ws = tok.encode(f" {text}", add_special_tokens=False)
-            cand_no = tok.encode(text, add_special_tokens=False)
-            for cand in (cand_ws, cand_no):
-                if len(cand) > 0:
-                    target = cand
-                    break
-            t = start_t - 1  # logits[t] predicts labels[t]
-            total = 0.0
-            # Bound check in case target is longer than remaining steps
-            max_k = min(len(target), logits_seq.shape[0] - t)
-            for k in range(max_k):
-                step_logits = logits_seq[t + k]               # [vocab]
-                total += F.log_softmax(step_logits, dim=-1)[target[k]].item()
-            return total
-
+        abcd_idx = [
+            tokenizer("A", add_special_tokens=False).input_ids[0],
+            tokenizer("B", add_special_tokens=False).input_ids[0],
+            tokenizer("C", add_special_tokens=False).input_ids[0],
+            tokenizer("D", add_special_tokens=False).input_ids[0],
+        ]
         accuracy = evaluate.load("accuracy")
-
         class MMLUEvalCallback(transformers.TrainerCallback):
             def on_evaluate(self, args, state, control, model, **kwargs):
-                # Temporarily disable length grouping for this special dataloader
-                prev_group = trainer.args.group_by_length
-                trainer.args.group_by_length = False
-                try:
-                    data_loader = trainer.get_eval_dataloader(mmlu_dataset)
-                finally:
-                    trainer.args.group_by_length = prev_group
+                data_loader = trainer.get_eval_dataloader(mmlu_dataset)
                 source_max_len = trainer.data_collator.source_max_len
                 trainer.data_collator.source_max_len = args.mmlu_source_max_len
                 trainer.model.eval()
                 preds, refs = [], []
                 loss_mmlu = 0
                 for batch in tqdm(data_loader, total=len(data_loader)):
-                    (loss, logits, labels) = trainer.prediction_step(
-                        trainer.model, batch, prediction_loss_only=False,
-                    )
+                    (loss, logits, labels) = trainer.prediction_step(trainer.model,batch,prediction_loss_only=False,)
                     # There are two tokens, the output, and eos token.
                     for i, logit in enumerate(logits):
                         label_non_zero_id = (batch['labels'][i] != -100).nonzero()[0][0]
-                        if all(tok_id is not None for tok_id in abcd_idx):
-                            # Fast path: all letters are single tokens
-                            logit_step = logit[label_non_zero_id - 1]
-                            logit_abcd = logit_step[abcd_idx]
-                            preds.append(int(torch.argmax(logit_abcd).item()))
-                        else:
-                            # Slow but robust path: handle multi-token encodings
-                            scores = [
-                                choice_logprob_first_tokens(logit, label_non_zero_id, tokenizer, ch)
-                                for ch in "ABCD"
-                            ]
-                            preds.append(int(torch.tensor(scores).argmax().item()))
-
-                    # === Robust refs extraction ===
-                    # Get the first non-IGNORE token for each example
-                    gold_first_tokens = labels[labels != IGNORE_INDEX].view(-1, 2)[:, 0].tolist()
-
-                    for tok in gold_first_tokens:
-                        if tok in abcd_idx:
-                            refs.append(abcd_idx.index(tok))
-                        else:
-                            # Fallback: decode and map to A/B/C/D
-                            txt = tokenizer.decode([tok], skip_special_tokens=True).strip().upper()
-                            letter = txt[:1] if txt else ""
-                            if letter in "ABCD":
-                                refs.append("ABCD".index(letter))
-                            else:
-                                # As a last resort, guess 'A' to avoid crash (won't affect stability)
-                                refs.append(0)
-
+                        logit_abcd = logit[label_non_zero_id-1][abcd_idx]
+                        preds.append(torch.argmax(logit_abcd).item())
+                    labels = labels[labels != IGNORE_INDEX].view(-1, 2)[:,0]
+                    refs += [abcd_idx.index(label) for label in labels.tolist()]
                     loss_mmlu += loss.item()
-
                 # Extract results by subject.
-                results = {'mmlu_loss': loss_mmlu / len(data_loader)}
+                results = {'mmlu_loss':loss_mmlu/len(data_loader)}
                 subject = mmlu_dataset['subject']
-                subjects = {s: {'refs': [], 'preds': []} for s in set(subject)}
-                for s, p, r in zip(subject, preds, refs):
+                subjects = {s:{'refs':[], 'preds':[]} for s in set(subject)}
+                for s,p,r in zip(subject, preds, refs):
                     subjects[s]['preds'].append(p)
                     subjects[s]['refs'].append(r)
                 subject_scores = []
-                for subj in subjects:
+                for subject in subjects:
                     subject_score = accuracy.compute(
-                        references=subjects[subj]['refs'],
-                        predictions=subjects[subj]['preds']
+                        references=subjects[subject]['refs'],
+                        predictions=subjects[subject]['preds']
                     )['accuracy']
-                    results[f'mmlu_{args.mmlu_split}_accuracy_{subj}'] = subject_score
+                    results[f'mmlu_{args.mmlu_split}_accuracy_{subject}'] = subject_score
                     subject_scores.append(subject_score)
-                results[f'mmlu_{args.mmlu_split}_accuracy'] = float(np.mean(subject_scores))
+                results[f'mmlu_{args.mmlu_split}_accuracy'] = np.mean(subject_scores)
                 trainer.log(results)
-                trainer.save_metrics("test", results)
-                print("Logging Results Here!---------------------------------------------------------------------------------")
                 trainer.data_collator.source_max_len = source_max_len
 
         trainer.add_callback(MMLUEvalCallback)
-
 
     # Verifying the datatypes and parameter counts before training.
     print_trainable_parameters(args, model)
